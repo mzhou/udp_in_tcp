@@ -6,11 +6,11 @@ use std::sync::Arc;
 use std::vec::Vec;
 
 use clap::{App, AppSettings, Arg, ArgMatches};
-use maligned::{aligned, A4k};
+use maligned::{A4k, aligned, align_first};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::runtime::Runtime;
-use tokio::sync::Mutex;
+use tokio::sync::broadcast;
 
 use flex_buffer::FlexBuffer;
 
@@ -64,6 +64,20 @@ async fn recv_main(matches: &ArgMatches<'_>) -> TokioVoidResult {
     }
 }
 
+async fn tcp_sender(mut receiver: broadcast::Receiver<Arc<Vec<u8>>>, mut tcp_stream: TcpStream) -> TokioVoidResult {
+    loop {
+        match receiver.recv().await {
+            Err(_) => {
+                eprintln!("recv failed in tcp_sender");
+                return tokio_ok();
+            },
+            Ok(data_arc) => {
+                tcp_stream.write_all(&data_arc[..]).await?;
+            },
+        };
+    }
+}
+
 async fn send_main(matches: &ArgMatches<'_>) -> TokioVoidResult {
     let tcp_listener = TcpListener::bind(matches.value_of(TCP_LISTEN).unwrap()).await?;
     let udp_listener = UdpSocket::bind(matches.value_of(UDP_LISTEN).unwrap()).await?;
@@ -71,53 +85,31 @@ async fn send_main(matches: &ArgMatches<'_>) -> TokioVoidResult {
         udp_listener.connect(udp_connect).await?;
     }
 
-    let tcp_streams = Arc::new(Mutex::new(Vec::<TcpStream>::new()));
+    let (send_channel, _) = broadcast::channel::<Arc<Vec<u8>>>(1024);
 
     // https://rust-lang.github.io/async-book/07_workarounds/03_err_in_async_blocks.html
 
-    let tcp_streams_f = tcp_streams.clone();
+    let send_channel_f = send_channel.clone();
     #[allow(unreachable_code)]
     let forwarder = tokio::spawn(async move {
         let mut udp_listener = udp_listener;
-        let mut buf = aligned::<A4k, _>([0u8; 64 * 1024 + 2]);
         loop {
+            let mut buf = align_first::<u8, A4k>(64 * 1024 + 2);
             let size = udp_listener.recv(&mut buf[2..]).await?;
-            let write_size = 2 + size;
             // 2 byte header for LE order size
             buf[0] = (size & 0xff).try_into().unwrap();
             buf[1] = (size >> 8).try_into().unwrap();
-            let mut tcp_streams_locked = tcp_streams_f.lock().await;
-            let mut valid_streams = tcp_streams_locked.len();
-            let mut i = 0;
-            while i < valid_streams {
-                if let Ok(written_size) = tcp_streams_locked[i].write(&buf[..write_size]).await {
-                    if written_size == write_size {
-                        // a-ok, go to next stream
-                        i += 1;
-                        continue;
-                    }
-                }
-                // os buffer full, mark the stream for deletion by moving to end
-                tcp_streams_locked.swap(i, valid_streams - 1);
-                valid_streams -= 1;
-                // process the current slot again, since the potentially valid one from the end
-                // was swapped in
-            }
-            // actually delete the streams
-            tcp_streams_locked.truncate(valid_streams);
+            let _ = send_channel_f.send(Arc::new(buf));
         }
         tokio_ok()
     });
 
-    let tcp_streams_a = tcp_streams.clone();
     #[allow(unreachable_code)]
     let accepter = tokio::spawn(async move {
         let mut tcp_listener = tcp_listener;
         loop {
             let (stream, _) = tcp_listener.accept().await?;
-            let _ = stream.set_send_buffer_size(4 * 1024 * 1024);
-            let mut tcp_streams_locked = tcp_streams_a.lock().await;
-            tcp_streams_locked.push(stream);
+            tokio::spawn(tcp_sender(send_channel.subscribe(), stream));
         }
         tokio_ok()
     });
