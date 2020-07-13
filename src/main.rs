@@ -26,13 +26,13 @@ fn tokio_ok() -> TokioVoidResult {
     Ok(())
 }
 
-async fn read_into<Reader>(reader: &mut Reader, buf: &mut FlexBuffer<'_>) -> TokioVoidResult
+async fn read_into<Reader>(reader: &mut Reader, buf: &mut FlexBuffer<'_>) -> Result<usize, tokio::io::Error>
 where
     Reader: AsyncReadExt + Unpin,
 {
     let size = reader.read(buf.bytes_mut()).await?;
     buf.advance_mut(size);
-    tokio_ok()
+    Ok(size)
 }
 
 async fn recv_main(matches: &ArgMatches<'_>) -> TokioVoidResult {
@@ -46,29 +46,35 @@ async fn recv_main(matches: &ArgMatches<'_>) -> TokioVoidResult {
     let mut backing = *aligned::<A4k, _>([0u8; 128 * 1024]);
     let mut buf = FlexBuffer::new(&mut backing);
 
-    loop {
+    'outer: loop {
         while buf.remaining() < 2 {
             buf.compact_if_less(2);
-            read_into(&mut tcp_stream, &mut buf).await?;
+            let read_size = read_into(&mut tcp_stream, &mut buf).await?;
+            if read_size == 0 {
+                break 'outer;
+            }
         }
         let header_bytes = buf.bytes();
         let size = (usize::from(header_bytes[1]) << 8) | usize::from(header_bytes[0]);
         buf.advance(2);
         while buf.remaining() < size {
             buf.compact_if_less(size);
-            read_into(&mut tcp_stream, &mut buf).await?;
+            let read_size = read_into(&mut tcp_stream, &mut buf).await?;
+            if read_size == 0 {
+                break 'outer;
+            }
         }
-        let sent_size = udp_sender.send(&buf.bytes()[..size]).await?;
-        assert_eq!(sent_size, size, "udp short send");
+        let _ = udp_sender.send(&buf.bytes()[..size]).await;
         buf.advance(size);
     }
+
+    tokio_ok()
 }
 
 async fn tcp_sender(mut receiver: broadcast::Receiver<Arc<Vec<u8>>>, mut tcp_stream: TcpStream) -> TokioVoidResult {
     loop {
         match receiver.recv().await {
             Err(_) => {
-                eprintln!("recv failed in tcp_sender");
                 return tokio_ok();
             },
             Ok(data_arc) => {
@@ -94,11 +100,13 @@ async fn send_main(matches: &ArgMatches<'_>) -> TokioVoidResult {
     let forwarder = tokio::spawn(async move {
         let mut udp_listener = udp_listener;
         loop {
-            let mut buf = align_first::<u8, A4k>(64 * 1024 + 2);
+            let mut buf = align_first::<u8, A4k>(2 + 64 * 1024);
+            buf.resize(buf.capacity(), 0u8);
             let size = udp_listener.recv(&mut buf[2..]).await?;
             // 2 byte header for LE order size
             buf[0] = (size & 0xff).try_into().unwrap();
             buf[1] = (size >> 8).try_into().unwrap();
+            buf.truncate(size + 2);
             let _ = send_channel_f.send(Arc::new(buf));
         }
         tokio_ok()

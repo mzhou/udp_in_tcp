@@ -16,6 +16,7 @@ impl FlexBuffer<'_> {
     pub fn compact(self: &mut Self) -> () {
         self.backing
             .copy_within(self.valid_first..self.valid_first + self.valid_len, 0);
+        self.valid_first = 0;
     }
 
     /// compact if can't fill to total of min valid bytes
